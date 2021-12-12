@@ -8,6 +8,5 @@
     "sourceMap": true,
     "declaration": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["src/index.browser.ts"]
+  "include": ["src/**/*"]
 }

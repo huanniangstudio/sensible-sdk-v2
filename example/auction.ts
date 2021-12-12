@@ -1,44 +1,42 @@
 import { SensiblequeryProvider } from "@sensible-contract/providers";
-import { Wallet } from "@sensible-contract/wallet";
+import { LocalWallet } from "@sensible-contract/wallets";
 import { Sensible } from "../src/index";
 
 let CREATURE = {
   codehash: "22519e29424dc4b94b9273b6500ebadad7b9ad02",
   genesis: "f3ac15d9e40ff55c79517065f7c02bd6121f592c",
-  tokenIndex: "16",
+  tokenIndex: "23",
 };
 
 let provider = new SensiblequeryProvider();
-let wallet = Wallet.fromWIF("xxx");
+let wallet = LocalWallet.fromWIF("xxxxx");
 let sensible = new Sensible(provider, wallet);
+let address = "16dpFB5oUCL9Cj2Mq9fUEJCLLqTzn6bQQg";
 
 async function startNftAuction() {
-  await sensible.startNftAuction({
+  let { txids } = await sensible.startNftAuction({
     nft: CREATURE,
     startBsvPrice: 500,
     endTimeStamp: Date.now() + 10 * 60 * 1000,
+    feeAddress: address,
+    feeAmount: 450,
   });
+  console.log("startNftAuction", txids);
 }
 
 async function bid() {
-  await sensible.bidInNftAuction({
+  let { txid } = await sensible.bidInNftAuction({
     nft: CREATURE,
-    nftAuctionUtxo: {
-      txId: "c8d0d04d30378e4d299cb35076040c58bb7c08155e8c7ffdb07f342e7e6d79b3",
-      outputIndex: 0,
-    },
     bsvBidPrice: 10001,
   });
+  console.log("bid", txid);
 }
 
 async function withdraw() {
-  await sensible.withdrawInNftAuction({
+  let { txids } = await sensible.withdrawInNftAuction({
     nft: CREATURE,
-    nftAuctionUtxo: {
-      txId: "8562b5e3f5e7e1b05c7fb2640ed0da455b18d18466dd9254776b514e25bab8b3",
-      outputIndex: 0,
-    },
   });
+  console.log("withdraw", txids);
 }
 async function run() {
   try {

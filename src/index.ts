@@ -1,6 +1,15 @@
-import { AbstractWallet } from "@sensible-contract/abstract-wallet";
+import { Wallet } from "@sensible-contract/abstract-wallet";
 import * as bsv from "@sensible-contract/bsv";
 import { BN } from "@sensible-contract/bsv";
+import {
+  createBidTx,
+  createNftAuctionContractTx,
+  createNftForAuctionContractTx,
+  createWithdrawTx,
+  getNftAuctionInput,
+  getNftAuctionUtxo,
+  WitnessOracle,
+} from "@sensible-contract/nft-auction-js";
 import {
   createNftGenesisTx,
   createNftMetaDataTx,
@@ -8,11 +17,18 @@ import {
   createNftTransferTx,
   createNftUnlockCheckContractTx,
   getNftGenesisInfo,
+  getNftGenesisInput,
   getNftInput,
   NftMetaData,
   NftSigner,
 } from "@sensible-contract/nft-js";
 import { NFT_UNLOCK_CONTRACT_TYPE } from "@sensible-contract/nft-js/lib/contract-factory/nftUnlockContractCheck";
+import {
+  createBuyNftTx,
+  createCancelSellNftTx,
+  createNftSellContractTx,
+  getSellInput,
+} from "@sensible-contract/nft-sell-js";
 import { SensiblequeryProvider } from "@sensible-contract/providers";
 import { P2PKH_UNLOCK_SIZE } from "@sensible-contract/sdk-core";
 import {
@@ -20,23 +36,25 @@ import {
   createTokenIssueTx,
   createTokenTransferCheckContractTx,
   createTokenTransferTx,
-  getCodehashAndGensisByTx,
+  createTokenUnlockCheckContractTx,
+  getTokenGenesisInfo,
+  getTokenGenesisInput,
   getTokenInputs,
   TokenSigner,
 } from "@sensible-contract/token-js";
-import { TOKEN_TRANSFER_TYPE } from "@sensible-contract/token-js/lib/contract-factory/tokenTransferCheck";
-import { TxComposer } from "@sensible-contract/tx-composer";
-import { toDecimalUnit } from "@sensible-contract/web3-utils";
 import {
-  createBidTx,
-  createNftAuctionContractTx,
-  createNftForAuctionContractTx,
-  createWithdrawTx,
-  getNftAuctionInput,
-  WitnessOracle,
-} from "nft-auction-js";
-const Signature = bsv.crypto.Signature;
-export const sighashType = Signature.SIGHASH_ALL | Signature.SIGHASH_FORKID;
+  TokenTransferCheckFactory,
+  TOKEN_TRANSFER_TYPE,
+} from "@sensible-contract/token-js/lib/contract-factory/tokenTransferCheck";
+import { TOKEN_UNLOCK_TYPE } from "@sensible-contract/token-js/lib/contract-factory/tokenUnlockContractCheck";
+import {
+  createTokenLockContractTx,
+  createUnlockTx,
+  getLockTokenAddress,
+  WitnessOracle as PledgeWitnessOracle,
+} from "@sensible-contract/token-lock-js";
+import { TxComposer } from "@sensible-contract/tx-composer";
+import { toDecimalUnit } from "./utils";
 type TokenAmount = {
   amount: string;
   decimal: number;
@@ -47,6 +65,13 @@ type Token = {
   codehash: string;
   genesis: string;
   sensibleId?: string;
+};
+
+type Utxo = {
+  txId: string;
+  outputIndex: number;
+  satoshis: number;
+  address: string;
 };
 async function sleep(time) {
   return new Promise((resolve, reject) => {
@@ -83,44 +108,35 @@ type NFT = {
   sensibleId?: string;
   tokenIndex?: string;
 };
+
+type TxOptions = {
+  onlyEstimateFee?: boolean;
+  noBroadcast?: boolean;
+};
+
+const DEFAULT_TX_OPTIONS: TxOptions = {
+  onlyEstimateFee: false,
+  noBroadcast: false,
+};
+
 let defaultNftSigner = new NftSigner({});
 async function getNftSigner(nft: NFT) {
   return defaultNftSigner;
 }
 
 export class Sensible {
-  public wallet: AbstractWallet;
+  public wallet: Wallet;
   public provider: SensiblequeryProvider;
-  constructor(provider: SensiblequeryProvider, wallet: AbstractWallet) {
+  constructor(provider: SensiblequeryProvider, wallet: Wallet) {
     this.provider = provider;
     this.wallet = wallet;
   }
 
+  //bsv
   async getBsvBalance() {
     let address = await this.wallet.getAddress();
     let balance = await this.provider.getBalance(address);
     return balance;
-  }
-
-  async getTokenBalance(codehash: string, genesis: string) {
-    let address = await this.wallet.getAddress();
-    let { balance, pendingBalance, decimal, utxoCount } =
-      await this.provider.getTokenBalance(codehash, genesis, address);
-    return toTokenAmount(balance, pendingBalance, decimal);
-  }
-
-  async getTokenSummarys({ cursor, size }: { cursor: number; size: number }) {
-    let address = await this.wallet.getAddress();
-    let _res = await this.provider.getTokenList(address);
-    return _res.list.map((v) => {
-      return {
-        codehash: v.codehash,
-        genesis: v.genesis,
-        sensibleId: v.sensibleId,
-        symbol: v.symbol,
-        tokenAmount: toTokenAmount(v.balance, v.pendingBalance, v.decimal),
-      };
-    });
   }
 
   private async mergeBsv() {
@@ -136,7 +152,6 @@ export class Sensible {
       });
       txComposer.addInputInfo({
         inputIndex: index,
-        sighashType,
       });
     });
     txComposer.appendChangeOutput(new bsv.Address(address));
@@ -144,7 +159,7 @@ export class Sensible {
       txComposer.getRawHex(),
       txComposer.getInputInfos()
     );
-    txComposer.sign(sigResults);
+    txComposer.unlock(sigResults);
 
     await this.provider.broadcast(txComposer.getRawHex());
     return {
@@ -171,7 +186,6 @@ export class Sensible {
       });
       txComposer.addInputInfo({
         inputIndex: index,
-        sighashType,
       });
     });
     txComposer.appendP2PKHOutput({
@@ -189,7 +203,10 @@ export class Sensible {
     return txComposer.getTxId();
   }
 
-  async transferBsvArray(arr: { to: string; amount: number }[]) {
+  async transferBsvArray(
+    arr: { to: string; amount: number }[],
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
     const txComposer = new TxComposer();
     let address = await this.wallet.getAddress();
     let utxos = await this.provider.getUtxos(address);
@@ -202,7 +219,6 @@ export class Sensible {
       });
       txComposer.addInputInfo({
         inputIndex: index,
-        sighashType,
       });
     });
     arr.forEach((v) => {
@@ -217,10 +233,14 @@ export class Sensible {
       txComposer.getRawHex(),
       txComposer.getInputInfos()
     );
-    txComposer.sign(sigResults);
+    txComposer.unlock(sigResults);
 
-    await this.provider.broadcast(txComposer.getRawHex());
-    return txComposer.getTxId();
+    if (options.noBroadcast) {
+      return { rawtx: txComposer.getRawHex() };
+    } else {
+      let txid = await this.provider.broadcast(txComposer.getRawHex());
+      return { txid };
+    }
   }
 
   async transferAllBsv(to: string) {
@@ -237,7 +257,6 @@ export class Sensible {
       });
       txComposer.addInputInfo({
         inputIndex: index,
-        sighashType,
       });
       amount += v.satoshis;
     });
@@ -261,12 +280,116 @@ export class Sensible {
     return await this.provider.broadcast(txComposer.getRawHex());
   }
 
+  //token
+  async genesisToken(
+    {
+      tokenSigner,
+      tokenName,
+      tokenSymbol,
+      decimalNum,
+    }: {
+      tokenSigner?: TokenSigner;
+      tokenName: string;
+      tokenSymbol: string;
+      decimalNum: number;
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
+    if (!tokenSigner) tokenSigner = defaultTokenSigner;
+    let address = await this.wallet.getAddress();
+    let publicKey = await this.wallet.getPublicKey();
+    let utxos = await this.provider.getUtxos(address);
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    let fee = createTokenGenesisTx.estimateFee({ utxoMaxCount: utxos.length });
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+    let { txComposer } = await createTokenGenesisTx({
+      tokenSigner,
+      tokenName,
+      tokenSymbol,
+      utxos,
+      genesisPublicKey: publicKey,
+      decimalNum,
+    });
+    let sigResults = await this.wallet.signTransaction(
+      txComposer.getRawHex(),
+      txComposer.getInputInfos()
+    );
+    txComposer.unlock(sigResults);
+    let token = getTokenGenesisInfo(tokenSigner, txComposer.getRawHex());
+
+    if (options.noBroadcast) {
+      return { token, rawtx: txComposer.getRawHex() };
+    } else {
+      let txid = await this.provider.broadcast(txComposer.getRawHex());
+      return { token, txid };
+    }
+  }
+
+  async issueToken(
+    {
+      token,
+      tokenAmount,
+      receiverAddress,
+      allowIncreaseIssues = false,
+    }: {
+      token: Token;
+      tokenAmount: string;
+      receiverAddress?: string;
+      allowIncreaseIssues?: boolean;
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
+    let tokenSigner = await getTokenSigner(token);
+    let address = await this.wallet.getAddress();
+    let publicKey = await this.wallet.getPublicKey();
+    if (!receiverAddress) receiverAddress = address;
+    let utxos = await this.provider.getUtxos(address);
+
+    let { genesisInput, genesisContract } = await getTokenGenesisInput(
+      this.provider,
+      { sensibleId: token.sensibleId }
+    );
+
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    let fee = createTokenIssueTx.estimateFee({
+      genesisInput,
+      allowIncreaseIssues,
+      utxoMaxCount: utxos.length,
+    });
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
+    let { txComposer } = await createTokenIssueTx({
+      tokenSigner,
+      genesisInput,
+      genesisContract,
+      utxos,
+      allowIncreaseIssues,
+      receiverAddress,
+      tokenAmount,
+    });
+    let sigResults = await this.wallet.signTransaction(
+      txComposer.getRawHex(),
+      txComposer.getInputInfos()
+    );
+    txComposer.unlock(sigResults);
+
+    if (options.noBroadcast) {
+      return { rawtx: txComposer.getRawHex() };
+    } else {
+      let txid = await this.provider.broadcast(txComposer.getRawHex());
+      return { txid };
+    }
+  }
+
   async transferToken(
     token: Token,
     receivers: {
       address: string;
       amount: string;
-    }[]
+    }[],
+    options: TxOptions = DEFAULT_TX_OPTIONS
   ) {
     let tokenSigner = await getTokenSigner(token);
     let address = await this.wallet.getAddress();
@@ -300,8 +423,29 @@ export class Sensible {
         amount: changeAmount.toString(10),
       });
     }
+
+    let tokenTransferType = TokenTransferCheckFactory.getOptimumType(
+      tokenInputs.length,
+      tokenOutputs.length
+    );
+
+    let fee1 = createTokenTransferCheckContractTx.estimateFee({
+      tokenTransferType,
+      utxoMaxCount: utxos.length,
+    });
+    let fee2 = createTokenTransferTx.estimateFee({
+      tokenInputs,
+      tokenOutputs,
+      tokenTransferType,
+      utxoMaxCount: 1,
+    });
+    let fee = fee1 + fee2;
+    if (options.onlyEstimateFee) return { fee };
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
     let ret0 = await createTokenTransferCheckContractTx({
-      tokenTransferType: TOKEN_TRANSFER_TYPE.IN_3_OUT_100,
+      tokenTransferType,
       tokenInputCount: tokenInputs.length,
       tokenOutputs,
       tokenID: tokenInputs[0].tokenID,
@@ -338,10 +482,17 @@ export class Sensible {
     );
     ret1.txComposer.unlock(sigResults1);
 
-    let txid_0 = await this.provider.broadcast(ret0.txComposer.getRawHex());
-    let txid_1 = await this.provider.broadcast(ret1.txComposer.getRawHex());
-    console.log("transfer broadcast", txid_1);
-    return ret1.txComposer.getTxId();
+    if (options.noBroadcast) {
+      return {
+        rawtxs: [ret0.txComposer.getRawHex(), ret1.txComposer.getRawHex()],
+      };
+    } else {
+      let txid0 = await this.provider.broadcast(ret0.txComposer.getRawHex());
+      let txid1 = await this.provider.broadcast(ret1.txComposer.getRawHex());
+      return {
+        txids: [txid0, txid1],
+      };
+    }
   }
 
   async mergeToken(token: Token) {
@@ -355,6 +506,7 @@ export class Sensible {
       utxos = [_res.utxo];
     }
 
+    //merge up 100 times.
     for (let i = 0; i < 100; i++) {
       let { utxoCount } = await this.provider.getTokenBalance(
         token.codehash,
@@ -423,7 +575,6 @@ export class Sensible {
 
       let txid_0 = await this.provider.broadcast(ret0.txComposer.getRawHex());
       let txid_1 = await this.provider.broadcast(ret1.txComposer.getRawHex());
-      console.log("merge broadcast", txid_1);
       await sleep(2);
       utxos = [
         {
@@ -440,89 +591,53 @@ export class Sensible {
     };
   }
 
-  async genesisToken({
-    tokenSigner,
-    tokenName,
-    tokenSymbol,
-    decimalNum,
-  }: {
-    tokenSigner?: TokenSigner;
-    tokenName: string;
-    tokenSymbol: string;
-    decimalNum: number;
-  }) {
-    if (!tokenSigner) tokenSigner = defaultTokenSigner;
+  async getTokenBalance(token: Token) {
     let address = await this.wallet.getAddress();
-    let publicKey = await this.wallet.getPublicKey();
-    let utxos = await this.provider.getUtxos(address);
-    let { txComposer } = await createTokenGenesisTx(this.provider, {
-      tokenSigner,
-      tokenName,
-      tokenSymbol,
-      utxos,
-      genesisPublicKey: publicKey,
-      decimalNum,
-    });
-    let sigResults = await this.wallet.signTransaction(
-      txComposer.getRawHex(),
-      txComposer.getInputInfos()
-    );
-    txComposer.unlock(sigResults);
-    let token = getCodehashAndGensisByTx(tokenSigner, txComposer.getRawHex());
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    return {
-      txid,
-      token,
-    };
+    let { balance, pendingBalance, decimal, utxoCount } =
+      await this.provider.getTokenBalance(
+        token.codehash,
+        token.genesis,
+        address
+      );
+    return toTokenAmount(balance, pendingBalance, decimal);
   }
 
-  async issueToken({
-    token,
-    tokenAmount,
-    receiverAddress,
-    allowIncreaseIssues = false,
-  }: {
-    token: Token;
-    tokenAmount: string;
-    receiverAddress?: string;
-    allowIncreaseIssues?: boolean;
-  }) {
-    let tokenSigner = await getTokenSigner(token);
+  async getTokenSummarys({ cursor, size }: { cursor: number; size: number }) {
     let address = await this.wallet.getAddress();
-    let publicKey = await this.wallet.getPublicKey();
-    if (!receiverAddress) receiverAddress = address;
-    let utxos = await this.provider.getUtxos(address);
-    let { txComposer } = await createTokenIssueTx(this.provider, {
-      tokenSigner,
-      codehash: token.codehash,
-      genesis: token.genesis,
-      sensibleId: token.sensibleId,
-      genesisPublicKey: publicKey,
-      utxos,
-      allowIncreaseIssues,
-      receiverAddress,
-      tokenAmount,
+    let _res = await this.provider.getTokenList(address);
+    return _res.list.map((v) => {
+      return {
+        codehash: v.codehash,
+        genesis: v.genesis,
+        sensibleId: v.sensibleId,
+        symbol: v.symbol,
+        tokenAmount: toTokenAmount(v.balance, v.pendingBalance, v.decimal),
+      };
     });
-    let sigResults = await this.wallet.signTransaction(
-      txComposer.getRawHex(),
-      txComposer.getInputInfos()
-    );
-    txComposer.unlock(sigResults);
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    return txid;
   }
-
-  async genesisNft({
-    nftSigner,
-    totalSupply,
-  }: {
-    nftSigner?: NftSigner;
-    totalSupply: string;
-  }) {
+  //nft
+  async genesisNft(
+    {
+      nftSigner,
+      totalSupply,
+    }: {
+      nftSigner?: NftSigner;
+      totalSupply: string;
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
     if (!nftSigner) nftSigner = defaultNftSigner;
     let address = await this.wallet.getAddress();
     let publicKey = await this.wallet.getPublicKey();
     let utxos = await this.provider.getUtxos(address);
+
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    let fee = createNftGenesisTx.estimateFee({
+      utxoMaxCount: utxos.length,
+    });
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
     let { txComposer } = await createNftGenesisTx({
       nftSigner,
       utxos,
@@ -535,27 +650,51 @@ export class Sensible {
     );
     txComposer.unlock(sigResults);
     let nft = getNftGenesisInfo(nftSigner, txComposer.getRawHex());
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    return {
-      txid,
-      nft,
-    };
+
+    if (options.noBroadcast) {
+      return { nft, rawtx: txComposer.getRawHex() };
+    } else {
+      let txid = await this.provider.broadcast(txComposer.getRawHex());
+      return { nft, txid };
+    }
   }
 
-  async mintNft({
-    nft,
-    receiverAddress,
-    metaData,
-  }: {
-    nft: NFT;
-    metaData: NftMetaData;
-    receiverAddress?: string;
-  }) {
+  async mintNft(
+    {
+      nft,
+      receiverAddress,
+      metaData,
+    }: {
+      nft: NFT;
+      metaData: NftMetaData;
+      receiverAddress?: string;
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
     let nftSigner = await getNftSigner(nft);
     let address = await this.wallet.getAddress();
     let publicKey = await this.wallet.getPublicKey();
     if (!receiverAddress) receiverAddress = address;
     let utxos = await this.provider.getUtxos(address);
+
+    let { genesisInput, genesisContract } = await getNftGenesisInput(
+      this.provider,
+      {
+        codehash: nft.codehash,
+        genesis: nft.genesis,
+        sensibleId: nft.sensibleId,
+      }
+    );
+
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    let fee1 = createNftMetaDataTx.estimateFee({
+      metaData,
+      utxoMaxCount: utxos.length,
+    });
+    let fee2 = createNftMintTx.estimateFee({ genesisInput, utxoMaxCount: 1 });
+    let fee = fee1 + fee2;
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
 
     let nftMetaDataRet = await createNftMetaDataTx({
       utxos,
@@ -576,12 +715,10 @@ export class Sensible {
         address: address,
       },
     ];
-    let { txComposer } = await createNftMintTx(this.provider, {
+    let { txComposer } = await createNftMintTx({
       nftSigner,
-      codehash: nft.codehash,
-      genesis: nft.genesis,
-      sensibleId: nft.sensibleId,
-      genesisPublicKey: publicKey,
+      genesisInput,
+      genesisContract,
       utxos,
       receiverAddress,
       metaTxId: nftMetaDataRet.txComposer.getTxId(),
@@ -592,43 +729,37 @@ export class Sensible {
       txComposer.getInputInfos()
     );
     txComposer.unlock(sigResults);
-    let txid_0 = await this.provider.broadcast(
-      nftMetaDataRet.txComposer.getRawHex()
-    );
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    return txid;
-  }
 
-  async getNftMetaData(provider: SensiblequeryProvider, { nft }: { nft: NFT }) {
-    let nftUtxo = await provider.getNftUtxoDetail(
-      nft.codehash,
-      nft.genesis,
-      nft.tokenIndex
-    );
-    if (!nftUtxo) {
-      throw new Error("no such nft");
+    if (options.noBroadcast) {
+      return {
+        rawtxs: [nftMetaDataRet.txComposer.getRawHex(), txComposer.getRawHex()],
+      };
+    } else {
+      let txid0 = await this.provider.broadcast(
+        nftMetaDataRet.txComposer.getRawHex()
+      );
+      let txid1 = await this.provider.broadcast(txComposer.getRawHex());
+      return { txids: [txid0, txid1] };
     }
-    console.log(nftUtxo.metaTxId);
-    let rawhex = await provider.getRawTxData(nftUtxo.metaTxId);
-    let tx = new bsv.Transaction(rawhex);
-    let jsondata =
-      tx.outputs[nftUtxo.metaOutputIndex].script.chunks[2].buf.toString();
-    let data = JSON.parse(jsondata);
-    return data;
   }
 
-  async transferNft({
-    nft,
-    receiverAddress,
-  }: {
-    nft: NFT;
-    receiverAddress?: string;
-  }) {
+  async transferNft(
+    {
+      nft,
+      receiverAddress,
+      utxos,
+    }: {
+      nft: NFT;
+      receiverAddress?: string;
+      utxos?: Utxo[];
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
     let nftSigner = await getNftSigner(nft);
     let address = await this.wallet.getAddress();
     let publicKey = await this.wallet.getPublicKey();
     if (!receiverAddress) receiverAddress = address;
-    let utxos = await this.provider.getUtxos(address);
+    if (!utxos) utxos = await this.provider.getUtxos(address);
 
     let nftUtxoDetail = await this.provider.getNftUtxoDetail(
       nft.codehash,
@@ -646,6 +777,15 @@ export class Sensible {
       genesis: nft.genesis,
       nftUtxo,
     });
+
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    let fee = createNftTransferTx.estimateFee({
+      nftInput,
+      utxoMaxCount: utxos.length,
+    });
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
     let { txComposer } = await createNftTransferTx({
       nftSigner,
       nftInput,
@@ -658,8 +798,29 @@ export class Sensible {
     );
     txComposer.unlock(sigResults);
 
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    return txid;
+    if (options.noBroadcast) {
+      return { rawtx: txComposer.getRawHex() };
+    } else {
+      let txid = await this.provider.broadcast(txComposer.getRawHex());
+      return { txid };
+    }
+  }
+
+  async getNftMetaData(provider: SensiblequeryProvider, { nft }: { nft: NFT }) {
+    let nftUtxo = await provider.getNftUtxoDetail(
+      nft.codehash,
+      nft.genesis,
+      nft.tokenIndex
+    );
+    if (!nftUtxo) {
+      throw new Error("no such nft");
+    }
+    let rawhex = await provider.getRawTxData(nftUtxo.metaTxId);
+    let tx = new bsv.Transaction(rawhex);
+    let jsondata =
+      tx.outputs[nftUtxo.metaOutputIndex].script.chunks[2].buf.toString();
+    let data = JSON.parse(jsondata);
+    return data;
   }
 
   async getNftList(
@@ -672,68 +833,26 @@ export class Sensible {
       address,
       { cursor: 0, size: 10 }
     );
-    console.log(nfts);
+    return nfts;
   }
 
-  //invalid
-  private async transferNftWithOtherFee({
-    nft,
-    feeAddress,
-    receiverAddress,
-  }: {
-    nft: NFT;
-    feeAddress: string;
-    receiverAddress: string;
-  }) {
-    let nftSigner = await getNftSigner(nft);
-    let address = await this.wallet.getAddress();
-    let publicKey = await this.wallet.getPublicKey();
-    let utxos = await this.provider.getUtxos(feeAddress);
-
-    console.log("from", address, receiverAddress);
-
-    let nftUtxoDetail = await this.provider.getNftUtxoDetail(
-      nft.codehash,
-      nft.genesis,
-      nft.tokenIndex
-    );
-    let nftUtxo = {
-      txId: nftUtxoDetail.txid,
-      outputIndex: nftUtxoDetail.vout,
-      tokenAddress: nftUtxoDetail.address,
-      tokenIndex: nftUtxoDetail.tokenIndex,
-    };
-    let nftInput = await getNftInput(this.provider, {
-      codehash: nft.codehash,
-      genesis: nft.genesis,
-      nftUtxo,
-    });
-    let { txComposer } = await createNftTransferTx({
-      nftSigner,
-      nftInput,
-      utxos,
-      receiverAddress,
-    });
-    let inputInfos = txComposer.getInputInfos();
-    let info = inputInfos.splice(0, 1);
-    console.log(info);
-    let sigResults = await this.wallet.signTransaction(
-      txComposer.getRawHex(),
-      info
-    );
-
-    return { txComposer, sigResults, inputInfos };
-  }
-
-  async startNftAuction({
-    nft,
-    startBsvPrice,
-    endTimeStamp,
-  }: {
-    nft: NFT;
-    startBsvPrice: number;
-    endTimeStamp: number;
-  }) {
+  //nft-auction
+  async startNftAuction(
+    {
+      nft,
+      startBsvPrice,
+      endTimeStamp,
+      feeAddress,
+      feeAmount,
+    }: {
+      nft: NFT;
+      startBsvPrice: number;
+      endTimeStamp: number;
+      feeAddress: string;
+      feeAmount: number;
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
     let nftSigner = await getNftSigner(nft);
     let address = await this.wallet.getAddress();
     let publicKey = await this.wallet.getPublicKey();
@@ -756,29 +875,37 @@ export class Sensible {
       nftUtxo,
     });
 
-    let { auctionContractHash, txComposer } = await createNftAuctionContractTx(
-      this.provider,
-      {
-        nftSigner,
-        witnessOracle: new WitnessOracle(),
-        nftInput,
-        senderAddress: address,
-        startBsvPrice,
-        endTimeStamp,
-        utxos,
-      }
+    let fee1 = createNftAuctionContractTx.estimateFee({
+      utxoMaxCount: utxos.length,
+    });
+    let fee2Ret = await this.transferNft(
+      { nft, receiverAddress: address },
+      { onlyEstimateFee: true }
     );
+    let fee = fee1 + fee2Ret.fee;
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+    let { auctionContractHash, txComposer } = await createNftAuctionContractTx({
+      nftSigner,
+      witnessOracle: new WitnessOracle(),
+      nftInput,
+      feeAddress,
+      feeAmount,
+      senderAddress: address,
+      startBsvPrice,
+      endTimeStamp,
+      utxos,
+    });
     let sigResults = await this.wallet.signTransaction(
       txComposer.getRawHex(),
       txComposer.getInputInfos()
     );
     txComposer.unlock(sigResults);
 
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    console.log("create auction ", txid);
+    utxos = [txComposer.getChangeUtxo()];
 
-    await sleep(2);
-
+    //just for getting address
     let { nftForAuctionAddress } = await createNftForAuctionContractTx(
       this.provider,
       {
@@ -788,30 +915,71 @@ export class Sensible {
       }
     );
 
-    await this.transferNft({ nft, receiverAddress: nftForAuctionAddress });
+    let transferNftResult = await this.transferNft(
+      { nft, receiverAddress: nftForAuctionAddress, utxos },
+      {
+        noBroadcast: true,
+      }
+    );
+
+    if (options.noBroadcast) {
+      return { rawtxs: [txComposer.getRawHex(), transferNftResult.rawtx] };
+    } else {
+      let txid1 = await this.provider.broadcast(txComposer.getRawHex());
+      let txid2 = await this.provider.broadcast(transferNftResult.rawtx);
+      return { txids: [txid1, txid2] };
+    }
   }
 
-  async bidInNftAuction({
-    nft,
-    nftAuctionUtxo,
-    bsvBidPrice,
-  }: {
-    nft: NFT;
-    nftAuctionUtxo: { txId: string; outputIndex: number };
-    bsvBidPrice: number;
-  }) {
+  async bidInNftAuction(
+    {
+      nft,
+      bsvBidPrice,
+    }: {
+      nft: NFT;
+      bsvBidPrice: number;
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
     let nftSigner = await getNftSigner(nft);
     let address = await this.wallet.getAddress();
     let publicKey = await this.wallet.getPublicKey();
     let utxos = await this.provider.getUtxos(address);
 
-    // let nftAuctionUtxo = {
-    //   txId: "",
-    //   outputIndex: 0,
-    // };
+    let nftUtxoDetail = await this.provider.getNftUtxoDetail(
+      nft.codehash,
+      nft.genesis,
+      nft.tokenIndex
+    );
+
+    let nftUtxo = {
+      txId: nftUtxoDetail.txid,
+      outputIndex: nftUtxoDetail.vout,
+      tokenAddress: nftUtxoDetail.address,
+      tokenIndex: nftUtxoDetail.tokenIndex,
+    };
+
+    let nftInput = await getNftInput(this.provider, {
+      codehash: nft.codehash,
+      genesis: nft.genesis,
+      nftUtxo,
+    });
+    let nftAuctionUtxo = await getNftAuctionUtxo(this.provider, {
+      nftID: nftInput.nftID,
+    });
+
     let nftAuctionInput = await getNftAuctionInput(this.provider, {
       nftAuctionUtxo,
     });
+
+    let fee = createBidTx.estimateFee({
+      nftAuctionInput,
+      utxoMaxCount: utxos.length,
+    });
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
     let { txComposer } = await createBidTx({
       nftSigner,
       witnessOracle: new WitnessOracle(),
@@ -827,17 +995,22 @@ export class Sensible {
     );
     txComposer.unlock(sigResults);
 
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    console.log("bid success", txid);
+    if (options.noBroadcast) {
+      return { rawtx: txComposer.getRawHex() };
+    } else {
+      let txid = await this.provider.broadcast(txComposer.getRawHex());
+      return { txid };
+    }
   }
 
-  async withdrawInNftAuction({
-    nft,
-    nftAuctionUtxo,
-  }: {
-    nft: NFT;
-    nftAuctionUtxo: { txId: string; outputIndex: number };
-  }) {
+  async withdrawInNftAuction(
+    {
+      nft,
+    }: {
+      nft: NFT;
+    },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
     let nftSigner = await getNftSigner(nft);
     let address = await this.wallet.getAddress();
     let publicKey = await this.wallet.getPublicKey();
@@ -860,15 +1033,31 @@ export class Sensible {
       nftUtxo,
     });
 
-    // let nftAuctionUtxo = await this.provider.getNftAuctionUtxo();
-    // let nftAuctionUtxo = {
-    //   txId: "",
-    //   outputIndex: 0,
-    // };
-
+    let nftAuctionUtxo = await getNftAuctionUtxo(this.provider, {
+      nftID: nftInput.nftID,
+    });
     let nftAuctionInput = await getNftAuctionInput(this.provider, {
       nftAuctionUtxo,
     });
+
+    let nftUnlockType = NFT_UNLOCK_CONTRACT_TYPE.OUT_6;
+
+    let fee1 = createNftForAuctionContractTx.estimateFee({
+      utxoMaxCount: utxos.length,
+    });
+    let fee2 = createNftUnlockCheckContractTx.estimateFee({
+      nftUnlockType,
+      utxoMaxCount: 1,
+    });
+    let fee3 = createWithdrawTx.estimateFee({
+      nftAuctionInput,
+      nftInput,
+      utxoMaxCount: 1,
+    });
+    let fee = fee1 + fee2 + fee3;
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
 
     let nftForAuctionRet = await createNftForAuctionContractTx(this.provider, {
       nftInput,
@@ -884,17 +1073,10 @@ export class Sensible {
     );
     nftForAuctionRet.txComposer.unlock(sigResults0);
 
-    utxos = [
-      {
-        txId: nftForAuctionRet.txComposer.getTxId(),
-        outputIndex: 1,
-        satoshis: nftForAuctionRet.txComposer.getOutput(1).satoshis,
-        address: address,
-      },
-    ];
+    utxos = [nftForAuctionRet.txComposer.getChangeUtxo()];
 
     let unlockCheckRet = await createNftUnlockCheckContractTx({
-      nftUnlockType: NFT_UNLOCK_CONTRACT_TYPE.OUT_6,
+      nftUnlockType,
       codehash: nftInput.codehash,
       nftID: nftInput.nftID,
       utxos,
@@ -906,14 +1088,7 @@ export class Sensible {
     );
     unlockCheckRet.txComposer.unlock(sigResults1);
 
-    utxos = [
-      {
-        txId: unlockCheckRet.txComposer.getTxId(),
-        outputIndex: 1,
-        satoshis: unlockCheckRet.txComposer.getOutput(1).satoshis,
-        address: address,
-      },
-    ];
+    utxos = [unlockCheckRet.txComposer.getChangeUtxo()];
 
     let { txComposer } = await createWithdrawTx({
       nftSigner,
@@ -933,11 +1108,478 @@ export class Sensible {
     );
     txComposer.unlock(sigResults2);
 
-    await this.provider.broadcast(nftForAuctionRet.txComposer.getRawHex());
-    await sleep(2);
-    await this.provider.broadcast(unlockCheckRet.txComposer.getRawHex());
-    await sleep(2);
-    let txid = await this.provider.broadcast(txComposer.getRawHex());
-    console.log("withdraw ", txid);
+    if (options.noBroadcast) {
+      return {
+        rawtxs: [
+          nftForAuctionRet.txComposer.getRawHex(),
+          unlockCheckRet.txComposer.getRawHex(),
+          txComposer.getRawHex(),
+        ],
+      };
+    } else {
+      let txid1 = await this.provider.broadcast(
+        nftForAuctionRet.txComposer.getRawHex()
+      );
+      let txid2 = await this.provider.broadcast(
+        unlockCheckRet.txComposer.getRawHex()
+      );
+      let txid3 = await this.provider.broadcast(txComposer.getRawHex());
+      return { txids: [txid1, txid2, txid3] };
+    }
+  }
+
+  //nft-sell
+  async sellNft(
+    { nft, satoshisPrice }: { nft: NFT; satoshisPrice: number },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
+    let nftSigner = await getNftSigner(nft);
+    let address = await this.wallet.getAddress();
+    let publicKey = await this.wallet.getPublicKey();
+    let utxos = await this.provider.getUtxos(address);
+
+    let fee1 = createNftSellContractTx.estimateFee({
+      utxoMaxCount: utxos.length,
+    });
+    let _res = await this.transferNft({ nft }, { onlyEstimateFee: true });
+    let fee = fee1 + _res.fee;
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
+    let nftUtxoDetail = await this.provider.getNftUtxoDetail(
+      nft.codehash,
+      nft.genesis,
+      nft.tokenIndex
+    );
+    let nftUtxo = {
+      txId: nftUtxoDetail.txid,
+      outputIndex: nftUtxoDetail.vout,
+      tokenAddress: nftUtxoDetail.address,
+      tokenIndex: nftUtxoDetail.tokenIndex,
+    };
+    let nftInput = await getNftInput(this.provider, {
+      codehash: nft.codehash,
+      genesis: nft.genesis,
+      nftUtxo,
+    });
+
+    let nftSellRet = await createNftSellContractTx({
+      nftInput,
+      satoshisPrice,
+      utxos,
+    });
+    let sigResults = await this.wallet.signTransaction(
+      nftSellRet.txComposer.getRawHex(),
+      nftSellRet.txComposer.getInputInfos()
+    );
+    nftSellRet.txComposer.unlock(sigResults);
+
+    utxos = [nftSellRet.txComposer.getChangeUtxo()];
+
+    let { txComposer } = await createNftTransferTx({
+      nftSigner,
+      nftInput,
+      receiverAddress: nftSellRet.sellAddress,
+      utxos,
+    });
+    let sigResults2 = await this.wallet.signTransaction(
+      txComposer.getRawHex(),
+      txComposer.getInputInfos()
+    );
+    txComposer.unlock(sigResults2);
+
+    if (options.noBroadcast) {
+      return {
+        rawtxs: [nftSellRet.txComposer.getRawHex(), txComposer.getRawHex()],
+      };
+    } else {
+      let txid1 = await this.provider.broadcast(
+        nftSellRet.txComposer.getRawHex()
+      );
+      let txid2 = await this.provider.broadcast(txComposer.getRawHex());
+      return { txids: [txid1, txid2] };
+    }
+  }
+
+  async cancelSellNft(
+    { nft }: { nft: NFT },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
+    let nftSigner = await getNftSigner(nft);
+    let address = await this.wallet.getAddress();
+    let publicKey = await this.wallet.getPublicKey();
+    let utxos = await this.provider.getUtxos(address);
+
+    let nftUtxoDetail = await this.provider.getNftUtxoDetail(
+      nft.codehash,
+      nft.genesis,
+      nft.tokenIndex
+    );
+    let nftUtxo = {
+      txId: nftUtxoDetail.txid,
+      outputIndex: nftUtxoDetail.vout,
+      tokenAddress: nftUtxoDetail.address,
+      tokenIndex: nftUtxoDetail.tokenIndex,
+    };
+    let nftInput = await getNftInput(this.provider, {
+      codehash: nft.codehash,
+      genesis: nft.genesis,
+      nftUtxo,
+    });
+
+    let nftUnlockType = NFT_UNLOCK_CONTRACT_TYPE.OUT_6;
+
+    let fee1 = createNftUnlockCheckContractTx.estimateFee({
+      nftUnlockType,
+      utxoMaxCount: utxos.length,
+    });
+    let fee2 = createCancelSellNftTx.estimateFee({
+      nftInput,
+      utxoMaxCount: 1,
+    });
+    let fee = fee1 + fee2;
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
+    let sellUtxo = (
+      await this.provider.getNftSellUtxoDetail(
+        nft.codehash,
+        nft.genesis,
+        nft.tokenIndex,
+        {
+          ready: true,
+        }
+      )
+    ).map((v) => ({
+      txId: v.txid,
+      outputIndex: v.vout,
+      sellerAddress: v.address,
+      satoshisPrice: v.price,
+    }))[0];
+
+    let { sellInput, nftSellContract } = await getSellInput(this.provider, {
+      codehash: nft.codehash,
+      genesis: nft.genesis,
+      tokenIndex: nft.tokenIndex,
+      sellUtxo,
+    });
+
+    let nftSellTxComposer = new TxComposer(
+      new bsv.Transaction(sellInput.txHex)
+    );
+    let unlockCheckRet = await createNftUnlockCheckContractTx({
+      nftUnlockType,
+      codehash: nft.codehash,
+      nftID: nftInput.nftID,
+      utxos,
+    });
+
+    let sigResults = await this.wallet.signTransaction(
+      unlockCheckRet.txComposer.getRawHex(),
+      unlockCheckRet.txComposer.getInputInfos()
+    );
+    unlockCheckRet.txComposer.unlock(sigResults);
+
+    utxos = [unlockCheckRet.txComposer.getChangeUtxo()];
+
+    let { txComposer } = await createCancelSellNftTx({
+      nftSigner,
+      nftInput,
+      nftSellContract,
+      nftSellTxComposer,
+      nftUnlockCheckContract: unlockCheckRet.unlockCheckContract,
+      nftUnlockCheckTxComposer: unlockCheckRet.txComposer,
+      utxos,
+    });
+
+    let sigResults2 = await this.wallet.signTransaction(
+      txComposer.getRawHex(),
+      txComposer.getInputInfos()
+    );
+    txComposer.unlock(sigResults2);
+
+    if (options.noBroadcast) {
+      return {
+        rawtxs: [unlockCheckRet.txComposer.getRawHex(), txComposer.getRawHex()],
+      };
+    } else {
+      let txid1 = await this.provider.broadcast(
+        unlockCheckRet.txComposer.getRawHex()
+      );
+      let txid2 = await this.provider.broadcast(txComposer.getRawHex());
+      return { txids: [txid1, txid2] };
+    }
+  }
+
+  async buyNft({ nft }: { nft: NFT }, options: TxOptions = DEFAULT_TX_OPTIONS) {
+    let nftSigner = await getNftSigner(nft);
+    let address = await this.wallet.getAddress();
+    let publicKey = await this.wallet.getPublicKey();
+    let utxos = await this.provider.getUtxos(address);
+
+    let nftUtxoDetail = await this.provider.getNftUtxoDetail(
+      nft.codehash,
+      nft.genesis,
+      nft.tokenIndex
+    );
+    let nftUtxo = {
+      txId: nftUtxoDetail.txid,
+      outputIndex: nftUtxoDetail.vout,
+      tokenAddress: nftUtxoDetail.address,
+      tokenIndex: nftUtxoDetail.tokenIndex,
+    };
+    let nftInput = await getNftInput(this.provider, {
+      codehash: nft.codehash,
+      genesis: nft.genesis,
+      nftUtxo,
+    });
+
+    let sellUtxo = (
+      await this.provider.getNftSellUtxoDetail(
+        nft.codehash,
+        nft.genesis,
+        nft.tokenIndex,
+        {
+          ready: true,
+        }
+      )
+    ).map((v) => ({
+      txId: v.txid,
+      outputIndex: v.vout,
+      sellerAddress: v.address,
+      satoshisPrice: v.price,
+    }))[0];
+
+    let { sellInput, nftSellContract } = await getSellInput(this.provider, {
+      codehash: nft.codehash,
+      genesis: nft.genesis,
+      tokenIndex: nft.tokenIndex,
+      sellUtxo,
+    });
+
+    let nftUnlockType = NFT_UNLOCK_CONTRACT_TYPE.OUT_6;
+
+    let fee1 = createNftUnlockCheckContractTx.estimateFee({
+      nftUnlockType,
+      utxoMaxCount: utxos.length,
+    });
+    let fee2 = createBuyNftTx.estimateFee({
+      nftInput,
+      sellInput,
+      utxoMaxCount: 1,
+    });
+    let fee = fee1 + fee2;
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
+    let nftSellTxComposer = new TxComposer(
+      new bsv.Transaction(sellInput.txHex)
+    );
+    let unlockCheckRet = await createNftUnlockCheckContractTx({
+      nftUnlockType,
+      codehash: nft.codehash,
+      nftID: nftInput.nftID,
+      utxos,
+    });
+
+    let sigResults = await this.wallet.signTransaction(
+      unlockCheckRet.txComposer.getRawHex(),
+      unlockCheckRet.txComposer.getInputInfos()
+    );
+    unlockCheckRet.txComposer.unlock(sigResults);
+
+    utxos = [unlockCheckRet.txComposer.getChangeUtxo()];
+
+    let { txComposer } = await createBuyNftTx({
+      nftSigner,
+      nftInput,
+      nftSellContract,
+      nftSellTxComposer,
+      nftUnlockCheckContract: unlockCheckRet.unlockCheckContract,
+      nftUnlockCheckTxComposer: unlockCheckRet.txComposer,
+      utxos,
+    });
+
+    let sigResults2 = await this.wallet.signTransaction(
+      txComposer.getRawHex(),
+      txComposer.getInputInfos()
+    );
+    txComposer.unlock(sigResults2);
+
+    if (options.noBroadcast) {
+      return {
+        rawtxs: [unlockCheckRet.txComposer.getRawHex(), txComposer.getRawHex()],
+      };
+    } else {
+      let txid1 = await this.provider.broadcast(
+        unlockCheckRet.txComposer.getRawHex()
+      );
+      let txid2 = await this.provider.broadcast(txComposer.getRawHex());
+      return { txids: [txid1, txid2] };
+    }
+  }
+
+  //token-lock
+  async lockTokenToPledge(
+    {
+      token,
+      matureTime,
+      amount,
+    }: { token: Token; matureTime: number; amount: string },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
+    let tokenSigner = await getTokenSigner(token);
+    let address = await this.wallet.getAddress();
+    let publicKey = await this.wallet.getPublicKey();
+    let utxos = await this.provider.getUtxos(address);
+
+    matureTime = Math.floor(matureTime / 1000);
+
+    let pledgeAddress = await getLockTokenAddress({
+      witnessOracle: new PledgeWitnessOracle(),
+      ownerAddress: address,
+      matureTime,
+    });
+
+    let _res = await this.transferToken(
+      token,
+      [{ address: pledgeAddress, amount }],
+      options
+    );
+    return Object.assign({ pledgeAddress }, _res);
+  }
+
+  async unlockTokenFromPledge(
+    {
+      token,
+      pledgeAddress,
+      matureTime,
+    }: { token: Token; pledgeAddress: string; matureTime: number },
+    options: TxOptions = DEFAULT_TX_OPTIONS
+  ) {
+    let tokenSigner = await getTokenSigner(token);
+    let address = await this.wallet.getAddress();
+    let publicKey = await this.wallet.getPublicKey();
+    let utxos = await this.provider.getUtxos(address);
+
+    matureTime = Math.floor(matureTime / 1000);
+
+    let tokenUtxos = await this.provider.getTokenUtxos(
+      token.codehash,
+      token.genesis,
+      pledgeAddress,
+      { cursor: 0, size: 20 }
+    );
+    let tokenInputs = await getTokenInputs(this.provider, {
+      tokenSigner,
+      tokenUtxos,
+      codehash: token.codehash,
+      genesis: token.genesis,
+    });
+    let tokenOutputs = [
+      {
+        address,
+        amount: tokenUtxos
+          .reduce(
+            (pre, cur) => pre.add(BN.fromString(cur.tokenAmount, 10)),
+            BN.Zero
+          )
+          .toString(10),
+      },
+    ];
+
+    let tokenUnlockType = TOKEN_UNLOCK_TYPE.IN_20_OUT_5;
+    let fee1 = createTokenLockContractTx.estimateFee({
+      utxoMaxCount: utxos.length,
+    });
+    let fee2 = createTokenUnlockCheckContractTx.estimateFee({
+      tokenUnlockType,
+    });
+    let fee3 = createUnlockTx.estimateFee({
+      tokenInputs,
+      tokenOutputs,
+      tokenUnlockType,
+    });
+
+    let fee = fee1 + fee2 + fee3;
+    let balance = utxos.reduce((pre, cur) => cur.satoshis + pre, 0);
+    if (options.onlyEstimateFee) return { fee };
+    if (balance < fee) throw "Insufficient Bsv Balance.";
+
+    let tokenLockRet = await createTokenLockContractTx({
+      witnessOracle: new PledgeWitnessOracle(),
+      ownerAddress: address,
+      matureTime,
+      utxos,
+    });
+
+    let sigResults = await this.wallet.signTransaction(
+      tokenLockRet.txComposer.getRawHex(),
+      tokenLockRet.txComposer.getInputInfos()
+    );
+    tokenLockRet.txComposer.unlock(sigResults);
+
+    utxos = [tokenLockRet.txComposer.getChangeUtxo()];
+
+    let unlockCheckRet = await createTokenUnlockCheckContractTx({
+      tokenUnlockType,
+      tokenInputIndexArray: new Array(tokenUtxos.length)
+        .fill(0)
+        .map((v, index) => index + 1),
+      tokenOutputs,
+      codehash: token.codehash,
+      tokenID: tokenInputs[0].tokenID,
+      utxos,
+    });
+
+    let sigResults2 = await this.wallet.signTransaction(
+      unlockCheckRet.txComposer.getRawHex(),
+      unlockCheckRet.txComposer.getInputInfos()
+    );
+    unlockCheckRet.txComposer.unlock(sigResults2);
+
+    utxos = [unlockCheckRet.txComposer.getChangeUtxo()];
+
+    let ret = await createUnlockTx({
+      witnessOracle: new PledgeWitnessOracle(),
+      tokenSigner,
+      tokenInputs,
+      tokenOutputs,
+      tokenLockContract: tokenLockRet.tokenLockContract,
+      tokenLockTxComposer: tokenLockRet.txComposer,
+      unlockCheckContract: unlockCheckRet.unlockCheckContract,
+      unlockCheckTxComposer: unlockCheckRet.txComposer,
+      utxos,
+    });
+
+    let sigResults3 = await this.wallet.signTransaction(
+      ret.txComposer.getRawHex(),
+      ret.txComposer.getInputInfos()
+    );
+    ret.txComposer.unlock(sigResults3);
+
+    if (options.noBroadcast) {
+      return {
+        rawtxs: [
+          tokenLockRet.txComposer.getRawHex(),
+          unlockCheckRet.txComposer.getRawHex(),
+          ret.txComposer.getRawHex(),
+        ],
+      };
+    } else {
+      let txid1 = await this.provider.broadcast(
+        tokenLockRet.txComposer.getRawHex()
+      );
+      let txid2 = await this.provider.broadcast(
+        unlockCheckRet.txComposer.getRawHex()
+      );
+      let txid3 = await this.provider.broadcast(ret.txComposer.getRawHex());
+      return {
+        txids: [txid1, txid2, txid3],
+      };
+    }
   }
 }
